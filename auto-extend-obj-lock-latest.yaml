@@ -1131,43 +1131,81 @@ Resources:
           # S3 Select query to check the number of rows in the Athena CSV result.
           # Ensure you include Scan range in query, do not scan the whole object. Large objects for example 65GB times out!
           # Do not trigger S3 Batch if the number of rows is less than 1 (exluding the header)
+          #def select_query_function_csv(bucket, key, expression, fileheaderinfo, outputserialization):
+          #    resp = s3Client.select_object_content(
+          #        Bucket=bucket,
+          #        Key=key,
+          #        Expression=expression,
+          #        ExpressionType='SQL',
+          #        ScanRange={
+          #        'Start': 0,
+          #        'End': 10240
+          #        },
+          #        RequestProgress={
+          #            'Enabled': True
+          #        },
+          #        InputSerialization={
+          #            "CSV": {
+          #                'FileHeaderInfo': fileheaderinfo,
+          #            },
+          #        },
+          #        OutputSerialization={my_csv_output_serialization: {}}, )
+          #    for event in resp['Payload']:
+          #        if 'Records' in event:
+          #            # logger.info(event['Records']['Payload'].decode('utf-8'))
+          #            num_of_rows = int(event['Records']['Payload'].decode('utf-8'))
+          #            logger.info(f'There are {num_of_rows} of rows in the Athena query result')
+          #            return num_of_rows
+          #
+          
+          # S3 Select is no longer supported, since we only need to know if there are more than 2 rows
+          # read the first 1MB of the .csv and determine if there are a non-zero number of rows
           def select_query_function_csv(bucket, key, expression, fileheaderinfo, outputserialization):
-              resp = s3Client.select_object_content(
-                  Bucket=bucket,
-                  Key=key,
-                  Expression=expression,
-                  ExpressionType='SQL',
-                  ScanRange={
-                  'Start': 0,
-                  'End': 10240
-                  },
-                  RequestProgress={
-                      'Enabled': True
-                  },
-                  InputSerialization={
-                      "CSV": {
-                          'FileHeaderInfo': fileheaderinfo,
-                      },
-                  },
-                  OutputSerialization={my_csv_output_serialization: {}}, )
-              for event in resp['Payload']:
-                  if 'Records' in event:
-                      # logger.info(event['Records']['Payload'].decode('utf-8'))
-                      num_of_rows = int(event['Records']['Payload'].decode('utf-8'))
-                      logger.info(f'There are {num_of_rows} of rows in the Athena query result')
-                      return num_of_rows
-
-
-          # Retrieve Manifest ETag
-          def get_manifest_etag(manifest_s3_bucket, manifest_s3_key):
-              # Get manifest key ETag ####################################
+              s3 = boto3.client('s3')
+              
+              # Try to get the first 1MB of the file
               try:
-                  manifest_key_object_etag = s3Client.head_object(Bucket=manifest_s3_bucket, Key=manifest_s3_key)['ETag']
-              except ClientError as e:
-                  logger.error(e)
+                  response = s3.get_object(Bucket=bucket, Key=key, Range='bytes=0-1048575')
+                  content = response['Body'].read().decode('utf-8')
+                  is_truncated = int(response['ContentLength']) == 1048576  # Check if we got exactly 1MB
+              except s3.exceptions.InvalidRange:
+                  # If the file is smaller than 1MB, read the entire file
+                  response = s3.get_object(Bucket=bucket, Key=key)
+                  content = response['Body'].read().decode('utf-8')
+                  is_truncated = False
+              except Exception as e:
+                  logger.error(f"Error reading file {key} from bucket {bucket}: {str(e)}")
+                  return 0  # Return 0 if we can't read the file
+              
+              # Handle empty file
+              if not content.strip():
+                  logger.info('The file is empty')
+                  return 0
+              
+              # Use StringIO to create a file-like object
+              file_like_object = io.StringIO(content)
+              
+              # Create a CSV reader
+              csv_reader = csv.reader(file_like_object)
+              
+              # Skip the header if necessary
+              if fileheaderinfo == 'USE':
+                  try:
+                      next(csv_reader, None)
+                  except StopIteration:
+                      logger.info('The file only contains a header')
+                      return 0
+              
+              # Count all rows
+              row_count = sum(1 for _ in csv_reader)
+              
+              if is_truncated:
+                  logger.info(f'There are at least {row_count} rows in the CSV file (file exceeds 1MB)')
               else:
-                  logger.info(manifest_key_object_etag)
-                  return manifest_key_object_etag
+                  logger.info(f'There are exactly {row_count} rows in the CSV file')
+              
+              return row_count
+
 
 
           # S3 Batch Restore Job Function
